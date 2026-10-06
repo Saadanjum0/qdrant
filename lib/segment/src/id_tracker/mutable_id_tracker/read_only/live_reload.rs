@@ -15,6 +15,7 @@ use crate::id_tracker::mutable_id_tracker::mappings_storage::{mappings_path, rea
 use crate::id_tracker::mutable_id_tracker::versions_storage::{
     VERSION_ELEMENT_SIZE, versions_path,
 };
+use crate::id_tracker::point_moves::skip_retired_moved_out;
 use crate::types::SeqNumberType;
 
 /// Set of point offsets that changed during a [`ReadOnlyAppendableIdTracker::live_reload`].
@@ -168,12 +169,16 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
     }
 
     /// Post-LIST preloading on `CachedFs`. Appendable tracker reloads its handles during
-    /// [`Self::probe_committed`] on the inner filesystem, so this is a no-op.
+    /// [`Self::probe_committed`] on the inner filesystem, so only the move log is staged here, when
+    /// this tracker resolves point moves.
     pub fn live_preload(
         &self,
-        _fs: &impl CachedReadFs<File = S>,
+        fs: &impl CachedReadFs<File = S>,
     ) -> OperationResult<Vec<BoxFuture<'static, ()>>> {
-        Ok(Vec::new())
+        match &self.moves {
+            Some(moves) => moves.view.live_preload(fs),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Consume mapping and version changes appended to storage since the last reload.
@@ -204,6 +209,15 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
         // deletes act on the committed mapping immediately, and cancel still-pending inserts.
         let changes = self.read_new_mapping_changes(fs, preloaded)?;
 
+        if let Some(moves) = self.moves.as_mut() {
+            let entries = moves.view.read_new(fs)?;
+            let entries =
+                skip_retired_moved_out(entries, |internal_id| self.is_retired(internal_id));
+            if let Some(moves) = self.moves.as_mut() {
+                moves.state.ingest(entries);
+            }
+        }
+
         for change in &changes {
             log::trace!(target: "live-reload", "Read mapping in {:?} change: {:?}", self.segment_path, change);
         }
@@ -218,6 +232,10 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
                         .entry(external_id)
                         .or_default()
                         .push(internal_id);
+                }
+                MappingChange::Delete(external_id) if self.moves.is_some() => {
+                    // Resolving moves: the delete may belong to one, so it waits for the shard
+                    self.hold_delete(external_id);
                 }
                 MappingChange::Delete(external_id) => {
                     // A point can be both committed (an old offset) and pending (a not-yet-committed
@@ -235,10 +253,15 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
         // order, so that is its last covered pending offset; the covered ones before it are
         // superseded and never linked. A re-insert not covered yet stays pending, without hiding
         // the earlier insert.
+        let cancelled = self.cancelled_placeholders();
         let mut drained = Vec::new();
         self.pending_inserts.retain(|&external_id, internal_ids| {
             let covered = internal_ids.partition_point(|&internal_id| internal_id < committed);
-            if let Some(&internal_id) = internal_ids[..covered].last() {
+            let newest = internal_ids[..covered]
+                .iter()
+                .rev()
+                .find(|&&internal_id| !cancelled.contains(&(external_id, internal_id)));
+            if let Some(&internal_id) = newest {
                 drained.push((external_id, internal_id));
             }
             internal_ids.drain(..covered);
@@ -253,8 +276,19 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
             {
                 deleted.push(previous);
             }
+            // A settled move superseded this copy before the view committed it
+            if self
+                .moves
+                .as_mut()
+                .is_some_and(|moves| moves.premasked.remove(&internal_id))
+            {
+                self.mappings.drop(external_id);
+                continue;
+            }
             inserted.push(internal_id);
         }
+
+        self.settle_point_moves();
 
         // The drain runs in arbitrary hash order; both result lists are sorted ascending.
         inserted.sort_unstable();
