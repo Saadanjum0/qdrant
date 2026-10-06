@@ -20,6 +20,14 @@ impl<B: TurboVectorBlob> LiveReload for ReadOnlyImmutableTurboVectorStorage<B> {
         Ok(Vec::new())
     }
 
+    fn apply_deletions(
+        &mut self,
+        deleted_points: &SortedSlice<'_, PointOffsetType>,
+    ) -> OperationResult<()> {
+        self.deleted.insert_all(deleted_points);
+        Ok(())
+    }
+
     /// Vector data is immutable, so only the in-memory deletion flags are patched
     /// from the authoritative `deleted_points`; `fs` and `new_points` are unused.
     fn live_reload<Fs: UniversalReadFs<File = B::File>>(
@@ -29,7 +37,6 @@ impl<B: TurboVectorBlob> LiveReload for ReadOnlyImmutableTurboVectorStorage<B> {
         _new_points: &SortedSlice<'_, PointOffsetType>,
         _hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
-        self.deleted.insert_all(deleted_points);
-        Ok(())
+        self.apply_deletions(deleted_points)
     }
 }
