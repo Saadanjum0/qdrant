@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use common::types::PointOffsetType;
 use common::universal_io::UniversalRead;
 use futures::lock::Mutex;
+use smallvec::SmallVec;
 
 pub use self::live_reload::{LiveReloadResult, TrackerProbe};
 use crate::id_tracker::point_mappings::PointMappings;
@@ -41,12 +42,15 @@ pub struct ReadOnlyAppendableIdTracker<S: UniversalRead> {
     internal_to_version: Vec<SeqNumberType>,
     mappings: PointMappings,
 
-    /// Inserts read from the mappings log whose version is not flushed yet, keyed by external id.
+    /// Inserts read from the mappings log whose version is not flushed yet: per external id, the
+    /// offsets of its inserts in log order.
     ///
     /// These points are intentionally absent from [`Self::mappings`] (their data may be partially
     /// written). Each is linked in once its offset is covered by the versions file, or dropped if
-    /// a delete for it arrives first.
-    pending_inserts: HashMap<PointIdType, PointOffsetType>,
+    /// a delete for it arrives first. A point can have several: a reload reads the versions before
+    /// the mappings, so it may read a re-insert before the version of the insert before it. That
+    /// earlier insert is linked once its version lands, and is not hidden by the re-insert.
+    pending_inserts: HashMap<PointIdType, SmallVec<[PointOffsetType; 1]>>,
 
     /// Highest slot any insert in the mappings log has ever claimed, `None` while the log has
     /// claimed none. This is the slot a writer resumes above.

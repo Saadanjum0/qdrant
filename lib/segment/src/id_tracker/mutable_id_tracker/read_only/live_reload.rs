@@ -201,7 +201,7 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
         let committed = self.reload_versions(fs, max_committed_id, preloaded)? as PointOffsetType;
 
         // Consume new mapping changes. Inserts are buffered until committed (their version exists);
-        // deletes act on the committed mapping immediately, or cancel a still-pending insert.
+        // deletes act on the committed mapping immediately, and cancel still-pending inserts.
         let changes = self.read_new_mapping_changes(fs, preloaded)?;
 
         for change in &changes {
@@ -214,7 +214,10 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
                 MappingChange::Insert(external_id, internal_id) => {
                     self.max_claimed_internal_id =
                         self.max_claimed_internal_id.max(Some(internal_id));
-                    self.pending_inserts.insert(external_id, internal_id);
+                    self.pending_inserts
+                        .entry(external_id)
+                        .or_default()
+                        .push(internal_id);
                 }
                 MappingChange::Delete(external_id) => {
                     // A point can be both committed (an old offset) and pending (a not-yet-committed
@@ -228,9 +231,19 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
             }
         }
 
-        let drained = self
-            .pending_inserts
-            .extract_if(|_, &mut internal_id| internal_id < committed);
+        // Link each point's newest insert the versions file covers. Inserts claim offsets in log
+        // order, so that is its last covered pending offset; the covered ones before it are
+        // superseded and never linked. A re-insert not covered yet stays pending, without hiding
+        // the earlier insert.
+        let mut drained = Vec::new();
+        self.pending_inserts.retain(|&external_id, internal_ids| {
+            let covered = internal_ids.partition_point(|&internal_id| internal_id < committed);
+            if let Some(&internal_id) = internal_ids[..covered].last() {
+                drained.push((external_id, internal_id));
+            }
+            internal_ids.drain(..covered);
+            !internal_ids.is_empty()
+        });
         let mut inserted = Vec::new();
         for (external_id, internal_id) in drained {
             // An upsert re-links an existing external id to a new offset; the previously-committed
@@ -243,7 +256,7 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
             inserted.push(internal_id);
         }
 
-        // `extract_if` drains in arbitrary hash order; both result lists are sorted ascending.
+        // The drain runs in arbitrary hash order; both result lists are sorted ascending.
         inserted.sort_unstable();
         deleted.sort_unstable();
         deleted.dedup();
