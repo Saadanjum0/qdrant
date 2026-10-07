@@ -244,6 +244,9 @@ impl HNSWIndex {
         // as it will be discarded anyway
         let is_on_disk = true;
 
+        #[cfg(test)]
+        additional_links::test_hooks::record_graph(&graph_layers_builder);
+
         let graph = save_graph(
             graph_layers_builder,
             path,

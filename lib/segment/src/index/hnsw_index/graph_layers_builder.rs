@@ -419,6 +419,65 @@ impl GraphLayersBuilder {
         }
     }
 
+    /// Merge a payload-block subgraph that was built in its own id space.
+    /// `to_global` maps every point of `block` to its segment-wide id.
+    ///
+    /// Same result as [`Self::merge_block_from`] on a segment-sized builder, but takes `&self`
+    /// and visits only the block's own points.
+    pub fn merge_block(&self, block: GraphLayersBuilder, to_global: &[PointOffsetType]) {
+        debug_assert_eq!(block.links_layers.len(), to_global.len());
+        #[cfg(debug_assertions)]
+        {
+            // Two local ids mapping to the same point would silently corrupt
+            // the merged links, so make sure the block is a set.
+            let unique: std::collections::HashSet<_> = to_global.iter().copied().collect();
+            debug_assert_eq!(
+                unique.len(),
+                to_global.len(),
+                "payload block points must be unique",
+            );
+        }
+
+        for (local_id, levels) in block.links_layers.into_iter().enumerate() {
+            debug_assert_eq!(levels.len(), 1, "payload block points only have level 0");
+            let global_id = to_global[local_id] as usize;
+
+            for (level, block_links) in levels.into_iter().enumerate() {
+                let block_links = block_links.into_inner();
+                if block_links.links().is_empty() {
+                    continue;
+                }
+                let mut current_links = self.links_layers[global_id][level].write();
+                for &local_link in block_links.links() {
+                    let global_link = to_global[local_link as usize];
+                    // Containers hold a couple of `m0` links at most, so a scan
+                    // is cheaper than seeding a segment-sized visited list.
+                    if !current_links.links().contains(&global_link) {
+                        current_links.push(global_link);
+                    }
+                }
+            }
+        }
+
+        self.entry_points
+            .lock()
+            .merge_translated(block.entry_points.into_inner(), to_global);
+    }
+
+    /// Every point's links on every level, in stored order.
+    #[cfg(test)]
+    pub(crate) fn links_snapshot(&self) -> Vec<Vec<Vec<PointOffsetType>>> {
+        self.links_layers
+            .iter()
+            .map(|layers| {
+                layers
+                    .iter()
+                    .map(|links| links.read().links().to_vec())
+                    .collect()
+            })
+            .collect()
+    }
+
     fn num_points(&self) -> usize {
         self.links_layers.len()
     }
